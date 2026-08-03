@@ -179,7 +179,17 @@ async fn build_objects(pool: &SqlitePool) -> Result<(Vec<ObjectVariant>, Vec<Uni
     unions.push(erc_token_union);
 
     // model data objects
+    //
+    // When torii indexes multiple worlds, the same (namespace, name) model can
+    // be registered once per world, but GraphQL field/type names carry no
+    // world scope — async-graphql panics on the duplicate field ("Field `...`
+    // already exists"). Keep the first occurrence of each model name; the
+    // world-scoped views stay available through SQL and gRPC.
+    let mut seen_models = std::collections::HashSet::new();
     for model in &models {
+        if !seen_models.insert((model.namespace.clone(), model.name.clone())) {
+            continue;
+        }
         let schema: Ty = serde_json::from_str(&model.schema)
             .map_err(|e| anyhow::anyhow!(format!("Failed to parse model schema: {e}")))?;
         let type_mapping = build_type_mapping(&model.namespace, &schema);
