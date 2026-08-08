@@ -193,7 +193,10 @@ impl PaginationExecutor {
             stmt = stmt.bind(value);
         }
 
-        let mut rows = stmt.fetch_all(&self.pool).await?;
+        let mut rows = stmt.fetch_all(&self.pool).await.map_err(|e| {
+            tracing::error!(target: "torii::sqlite::query", %query, error = %e, "Paginated query failed.");
+            e
+        })?;
         let has_more = rows.len() >= fetch_limit as usize;
 
         if pagination.direction == PaginationDirection::Backward {
