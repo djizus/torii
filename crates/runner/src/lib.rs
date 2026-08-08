@@ -724,9 +724,16 @@ impl Runner {
             let control = engine_control.clone();
             let pool = readonly_pool.clone();
             let tables = self.args.indexing.world_registry_models.clone();
+            let exclusions: HashSet<Felt> = self
+                .args
+                .indexing
+                .world_registry_exclusions
+                .iter()
+                .filter_map(|address| Felt::from_hex(address.trim()).ok())
+                .collect();
             let mut registry_shutdown_rx = shutdown_tx.subscribe();
             tokio::spawn(async move {
-                let mut known: HashSet<Felt> = HashSet::new();
+                let mut known: HashSet<Felt> = exclusions;
                 loop {
                     tokio::select! {
                         _ = registry_shutdown_rx.recv() => break,

@@ -224,6 +224,16 @@ pub struct IndexingOptions {
     #[serde(default)]
     pub world_registry_models: Vec<String>,
 
+    /// World addresses the registry auto-discovery must never register
+    #[arg(
+        long = "indexing.world_registry_exclusions",
+        value_delimiter = ',',
+        help = "World addresses that world_registry_models auto-discovery skips — e.g. finished \
+                or abandoned games whose data should stop being indexed and served."
+    )]
+    #[serde(default)]
+    pub world_registry_exclusions: Vec<String>,
+
     /// Models to index
     #[arg(
         long = "indexing.models",
@@ -301,6 +311,7 @@ impl Default for IndexingOptions {
             contracts: vec![],
             namespaces: vec![],
             world_registry_models: vec![],
+            world_registry_exclusions: vec![],
             models: vec![],
             world_block: 0,
             controllers: false,
