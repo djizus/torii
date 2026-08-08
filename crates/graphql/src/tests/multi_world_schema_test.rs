@@ -34,7 +34,10 @@ mod tests {
             .unwrap()
             .create_if_missing(true)
             .with_regexp();
-        let pool = SqlitePoolOptions::new().connect_with(options).await.unwrap();
+        let pool = SqlitePoolOptions::new()
+            .connect_with(options)
+            .await
+            .unwrap();
         sqlx::migrate!("../migrations").run(&pool).await.unwrap();
 
         let provider = Arc::new(JsonRpcClient::new(HttpTransport::new(
@@ -106,9 +109,8 @@ mod tests {
 
         let sdl = schema.sdl();
         let field = "multiworldTestDuplicateModels";
-        assert_eq!(
+        assert!(
             sdl.matches(field).count() > 0,
-            true,
             "model field missing from schema"
         );
     }

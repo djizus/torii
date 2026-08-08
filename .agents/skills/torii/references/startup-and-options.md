@@ -38,6 +38,9 @@ Useful defaults and behavior:
   `--http.mkcert` can auto-generate local certs if `mkcert` exists.
 - Search behavior:
   Search tuning flags are applied in SQLite storage (`max_results`, min query length, snippets, prefix matching).
+- Dynamic contract management:
+  Set `TORII_ADMIN_TOKEN` to at least 32 characters to enable authenticated, append-only runtime contract registration.
+  The token is read only from the environment and is not included in dumped config.
 
 ## Endpoint map (default ports)
 
@@ -45,6 +48,8 @@ Useful defaults and behavior:
 - GraphQL: proxied on `http://127.0.0.1:8080/graphql`
 - SQL playground/query: `http://127.0.0.1:8080/sql` (when `--http.sql true`)
 - MCP: `http://127.0.0.1:8080/mcp`
+- Readiness: `http://127.0.0.1:8080/ready`
+- Dynamic contract management: `http://127.0.0.1:8080/admin/indexing/contracts` when `TORII_ADMIN_TOKEN` is set
 - gRPC: `127.0.0.1:50051` (`--grpc.addr`, `--grpc.port`)
 - Metrics: `127.0.0.1:9200/metrics` when `--metrics`
 - Relay:
@@ -200,4 +205,3 @@ gRPC options:
 - `--grpc.http2_keepalive_interval`
 - `--grpc.http2_keepalive_timeout`
 - `--grpc.max_message_size`
-

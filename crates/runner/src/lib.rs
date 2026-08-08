@@ -45,12 +45,14 @@ use torii_cache::InMemoryCache;
 use torii_cli::ToriiArgs;
 use torii_controllers::sync::ControllersSync;
 use torii_grpc_server::GrpcConfig;
+use torii_indexer::control::{engine_control_channel, EngineControlClient};
 use torii_indexer::engine::{Engine, EngineConfig};
 use torii_indexer::{FetcherConfig, FetchingFlags, IndexingFlags};
 use torii_libp2p_relay::Relay;
 use torii_messaging::{Messaging, MessagingConfig};
 use torii_processors::{EventProcessorConfig, Processors};
 use torii_server::proxy::{Proxy, ProxySettings};
+use torii_server::ContractManagementConfig;
 use torii_sqlite::executor::Executor;
 use torii_sqlite::{Sql, SqlConfig};
 use torii_storage::proto::{ContractDefinition, ContractType};
@@ -63,6 +65,8 @@ mod constants;
 
 use crate::constants::LOG_TARGET;
 const MIN_THREADS: usize = 1;
+const TORII_ADMIN_TOKEN_ENV: &str = "TORII_ADMIN_TOKEN";
+const MIN_ADMIN_TOKEN_LENGTH: usize = 32;
 
 #[derive(Debug, Clone)]
 pub enum AllocationStrategy {
@@ -645,6 +649,17 @@ impl Runner {
             "Runtime allocation calculated"
         );
 
+        let mut seen_startup_contracts = HashSet::new();
+        let startup_contracts = self
+            .args
+            .indexing
+            .contracts
+            .iter()
+            .map(|contract| contract.address)
+            .filter(|address| seen_startup_contracts.insert(*address))
+            .collect::<Vec<_>>();
+        let (engine_control, control_receiver) = engine_control_channel();
+        let contract_management = contract_management_config(engine_control)?;
         let mut engine: Engine<Arc<JsonRpcClient<HttpTransport>>> = Engine::new_with_controllers(
             storage.clone(),
             cache.clone(),
@@ -697,7 +712,8 @@ impl Runner {
             },
             shutdown_tx.clone(),
             controllers,
-        );
+        )
+        .with_control_receiver(control_receiver);
 
         let shutdown_rx = shutdown_tx.subscribe();
         let temp_dir = TempDir::new()?;
@@ -770,6 +786,8 @@ impl Runner {
             absolute_path.clone(),
             Arc::new(readonly_pool.clone()),
             self.args.server.raw_sql,
+            startup_contracts,
+            contract_management,
             storage.clone(),
             provider.clone(),
             self.version_spec.clone(),
@@ -934,6 +952,31 @@ impl Runner {
         info!(target: LOG_TARGET, "Shutdown complete");
         result
     }
+}
+
+fn contract_management_config(
+    control: EngineControlClient,
+) -> anyhow::Result<Option<ContractManagementConfig>> {
+    let token = match std::env::var(TORII_ADMIN_TOKEN_ENV) {
+        Ok(token) if !token.trim().is_empty() => token,
+        _ => {
+            info!(
+                target: LOG_TARGET,
+                environment_variable = TORII_ADMIN_TOKEN_ENV,
+                "Dynamic contract management endpoint is disabled."
+            );
+            return Ok(None);
+        }
+    };
+
+    if token.len() < MIN_ADMIN_TOKEN_LENGTH {
+        anyhow::bail!(
+            "{TORII_ADMIN_TOKEN_ENV} must contain at least {MIN_ADMIN_TOKEN_LENGTH} characters"
+        );
+    }
+
+    info!(target: LOG_TARGET, "Dynamic contract management endpoint is enabled.");
+    Ok(Some(ContractManagementConfig::new(token, control)))
 }
 
 async fn spawn_rebuilding_graphql_server<P: Provider + Sync + Send + Clone + Debug + 'static>(
