@@ -987,6 +987,7 @@ async fn spawn_rebuilding_graphql_server<P: Provider + Sync + Send + Clone + Deb
     storage: Arc<dyn ReadOnlyStorage>,
 ) {
     let mut broker = MemoryBroker::<ModelUpdate>::subscribe();
+    let mut active_server = None;
 
     loop {
         let shutdown_rx = shutdown_tx.subscribe();
@@ -994,9 +995,9 @@ async fn spawn_rebuilding_graphql_server<P: Provider + Sync + Send + Clone + Deb
             torii_graphql::server::new(shutdown_rx, &pool, messaging.clone(), storage.clone())
                 .await;
 
-        tokio::spawn(new_server);
-
+        let replacement = tokio::spawn(new_server);
         proxy_server.set_graphql_addr(new_addr).await;
+        replace_graphql_server(&mut active_server, replacement).await;
 
         // Break the loop if there are no more events
         if broker.next().await.is_none() {
@@ -1004,6 +1005,23 @@ async fn spawn_rebuilding_graphql_server<P: Provider + Sync + Send + Clone + Deb
         } else {
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
+    }
+
+    stop_graphql_server(active_server).await;
+}
+
+async fn replace_graphql_server(
+    active_server: &mut Option<tokio::task::JoinHandle<()>>,
+    replacement: tokio::task::JoinHandle<()>,
+) {
+    let previous = active_server.replace(replacement);
+    stop_graphql_server(previous).await;
+}
+
+async fn stop_graphql_server(server: Option<tokio::task::JoinHandle<()>>) {
+    if let Some(server) = server {
+        server.abort();
+        let _ = server.await;
     }
 }
 
@@ -1143,4 +1161,26 @@ async fn generate_mkcert_certificates() -> anyhow::Result<(String, String)> {
         cert_path.to_string_lossy().to_string(),
         key_path.to_string_lossy().to_string(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn replacing_graphql_server_stops_the_previous_server() {
+        let first = tokio::spawn(std::future::pending::<()>());
+        let first_status = first.abort_handle();
+        let second = tokio::spawn(std::future::pending::<()>());
+        let second_status = second.abort_handle();
+        let mut active_server = Some(first);
+
+        replace_graphql_server(&mut active_server, second).await;
+
+        assert!(first_status.is_finished());
+        assert!(!second_status.is_finished());
+
+        stop_graphql_server(active_server).await;
+        assert!(second_status.is_finished());
+    }
 }
