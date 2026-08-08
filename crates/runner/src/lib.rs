@@ -659,7 +659,7 @@ impl Runner {
             .filter(|address| seen_startup_contracts.insert(*address))
             .collect::<Vec<_>>();
         let (engine_control, control_receiver) = engine_control_channel();
-        let contract_management = contract_management_config(engine_control)?;
+        let contract_management = contract_management_config(engine_control.clone())?;
         let mut engine: Engine<Arc<JsonRpcClient<HttpTransport>>> = Engine::new_with_controllers(
             storage.clone(),
             cache.clone(),
@@ -714,6 +714,74 @@ impl Runner {
             controllers,
         )
         .with_control_receiver(control_receiver);
+
+        // World registry auto-discovery: poll the configured model tables for
+        // deployed world addresses and register each one as a WORLD contract.
+        // Polling the DB (instead of hooking event decoding) keeps this on the
+        // same proven path as the admin API, and re-registers everything after
+        // a reindex from zero without any operator involvement.
+        if !self.args.indexing.world_registry_models.is_empty() {
+            let control = engine_control.clone();
+            let pool = readonly_pool.clone();
+            let tables = self.args.indexing.world_registry_models.clone();
+            let mut registry_shutdown_rx = shutdown_tx.subscribe();
+            tokio::spawn(async move {
+                let mut known: HashSet<Felt> = HashSet::new();
+                loop {
+                    tokio::select! {
+                        _ = registry_shutdown_rx.recv() => break,
+                        _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                    }
+
+                    for table in &tables {
+                        let query = format!("SELECT DISTINCT address FROM [{table}]");
+                        // The table only exists once the registry world itself
+                        // has been indexed; treat errors as "nothing yet".
+                        let rows: Vec<(String,)> = match sqlx::query_as(&query).fetch_all(&pool).await
+                        {
+                            Ok(rows) => rows,
+                            Err(_) => continue,
+                        };
+
+                        for (address,) in rows {
+                            let Ok(address) = Felt::from_hex(address.trim()) else {
+                                continue;
+                            };
+                            if !known.insert(address) {
+                                continue;
+                            }
+
+                            let definition = ContractDefinition {
+                                address,
+                                r#type: ContractType::WORLD,
+                                starting_block: None,
+                            };
+                            match control.register_contract(definition).await {
+                                Ok(result) => {
+                                    info!(
+                                        target: LOG_TARGET,
+                                        address = format!("{address:#x}"),
+                                        table = %table,
+                                        outcome = ?result.outcome,
+                                        "Auto-registered world from registry model."
+                                    );
+                                }
+                                Err(error) => {
+                                    known.remove(&address);
+                                    warn!(
+                                        target: LOG_TARGET,
+                                        address = format!("{address:#x}"),
+                                        table = %table,
+                                        error = %error,
+                                        "Failed to auto-register world; will retry."
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
 
         let shutdown_rx = shutdown_tx.subscribe();
         let temp_dir = TempDir::new()?;
