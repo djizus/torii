@@ -1,5 +1,7 @@
 mod constants;
 
+pub mod control;
+
 #[cfg(test)]
 #[path = "test.rs"]
 mod test;

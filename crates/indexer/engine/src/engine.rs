@@ -4,12 +4,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use metrics::{counter, gauge};
-use starknet::core::types::{Event, TransactionContent};
+use starknet::core::types::{BlockId, BlockTag, Event, TransactionContent};
 use starknet::macros::selector;
 use starknet::providers::Provider;
 use starknet_crypto::Felt;
 use std::sync::LazyLock;
 use tokio::sync::broadcast::Sender;
+use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::Semaphore;
 use tokio::time::{sleep, Instant};
 use torii_cache::{Cache, ContractClassCache};
@@ -18,12 +19,18 @@ use torii_processors::{
     BlockProcessorContext, EventProcessorConfig, EventProcessorContext, Processors,
     TransactionProcessorContext,
 };
-use torii_storage::proto::{Contract, ContractCursor, ContractQuery, ContractType};
+use torii_storage::proto::{
+    Contract, ContractCursor, ContractDefinition, ContractQuery, ContractType,
+};
 use torii_storage::utils::format_event_id;
 use torii_storage::Storage;
 use tracing::{debug, error, info, trace};
 
 use crate::constants::LOG_TARGET;
+use crate::control::{
+    ContractManagementError, ContractRegistrationOutcome, ContractRegistrationResult,
+    EngineControlCommand, EngineControlReceiver,
+};
 use crate::error::{Error, ProcessError};
 use crate::IndexingFlags;
 use torii_indexer_fetcher::{
@@ -67,6 +74,7 @@ pub struct Engine<P: Provider + Send + Sync + Clone + std::fmt::Debug + 'static>
     // The last fetch result & cursors, in case the processing fails, but not fetching.
     // Thus we can retry the processing with the same data instead of fetching again.
     cached_fetch: Option<(Box<FetchResult>, HashMap<Felt, ContractType>)>,
+    control_receiver: Option<EngineControlReceiver>,
 }
 
 impl Default for EngineConfig {
@@ -85,6 +93,46 @@ impl Default for EngineConfig {
 struct UnprocessedEvent {
     keys: Vec<String>,
     data: Vec<String>,
+}
+
+fn try_receive_control_command(
+    receiver: &mut Option<EngineControlReceiver>,
+) -> Option<EngineControlCommand> {
+    let Some(active_receiver) = receiver else {
+        return None;
+    };
+
+    match active_receiver.try_recv() {
+        Ok(command) => Some(command),
+        Err(TryRecvError::Empty) => None,
+        Err(TryRecvError::Disconnected) => {
+            *receiver = None;
+            None
+        }
+    }
+}
+
+fn existing_contract_registration(
+    contract: &Contract,
+    definition: &ContractDefinition,
+    target_head: u64,
+) -> Result<ContractRegistrationResult, ContractManagementError> {
+    if contract.contract_type != definition.r#type {
+        return Err(ContractManagementError::TypeConflict {
+            address: definition.address,
+            registered_type: contract.contract_type,
+            requested_type: definition.r#type,
+        });
+    }
+
+    counter!("torii_indexer_contract_registrations_total", "outcome" => "already_registered")
+        .increment(1);
+
+    Ok(ContractRegistrationResult {
+        contract: contract.clone(),
+        outcome: ContractRegistrationOutcome::AlreadyRegistered,
+        target_head,
+    })
 }
 
 impl<P: Provider + Send + Sync + Clone + std::fmt::Debug + 'static> Engine<P> {
@@ -144,7 +192,13 @@ impl<P: Provider + Send + Sync + Clone + std::fmt::Debug + 'static> Engine<P> {
             fetcher: Fetcher::new(provider.clone(), fetcher_config),
             nft_metadata_semaphore,
             cached_fetch: None,
+            control_receiver: None,
         }
+    }
+
+    pub fn with_control_receiver(mut self, receiver: EngineControlReceiver) -> Self {
+        self.control_receiver = Some(receiver);
+        self
     }
 
     async fn get_contracts(&self) -> Result<HashMap<Felt, Contract>, Error> {
@@ -169,8 +223,16 @@ impl<P: Provider + Send + Sync + Clone + std::fmt::Debug + 'static> Engine<P> {
 
         let mut fetching_erroring_out = false;
         let mut processing_erroring_out = false;
+        let mut control_receiver = self.control_receiver.take();
 
         loop {
+            // Control commands share the storage transaction boundary with indexing.
+            // Polling here prevents a command from cancelling an in-flight iteration.
+            if let Some(command) = try_receive_control_command(&mut control_receiver) {
+                self.handle_control_command(command).await;
+                continue;
+            }
+
             tokio::select! {
                 _ = shutdown_rx.recv() => {
                     break Ok(());
@@ -274,6 +336,94 @@ impl<P: Provider + Send + Sync + Clone + std::fmt::Debug + 'static> Engine<P> {
                 }
             }
         }
+    }
+
+    async fn handle_control_command(&mut self, command: EngineControlCommand) {
+        match command {
+            EngineControlCommand::RegisterContract {
+                definition,
+                response,
+            } => {
+                let result = self.register_contract(definition).await;
+                if response.send(result).is_err() {
+                    debug!(target: LOG_TARGET, "Contract registration requester disconnected.");
+                }
+            }
+        }
+    }
+
+    async fn register_contract(
+        &mut self,
+        definition: ContractDefinition,
+    ) -> Result<ContractRegistrationResult, ContractManagementError> {
+        let existing_contract = self.get_contract(definition.address).await?;
+        let target_head = self
+            .provider
+            .block_hash_and_number()
+            .await
+            .map_err(|error| ContractManagementError::Provider(error.to_string()))?
+            .block_number;
+
+        if let Some(contract) = existing_contract {
+            return existing_contract_registration(&contract, &definition, target_head);
+        }
+
+        self.provider
+            .get_class_at(BlockId::Tag(BlockTag::PreConfirmed), definition.address)
+            .await
+            .map_err(|error| ContractManagementError::Provider(error.to_string()))?;
+
+        let starting_block = definition.starting_block.unwrap_or(self.config.world_block);
+        self.storage
+            .register_contract(
+                definition.address,
+                definition.r#type,
+                starting_block.saturating_sub(1),
+            )
+            .await
+            .map_err(|error| ContractManagementError::Storage(error.to_string()))?;
+
+        if let Err(error) = self.storage.execute().await {
+            let _ = self.storage.rollback().await;
+            return Err(ContractManagementError::Storage(error.to_string()));
+        }
+
+        let contract = self
+            .get_contract(definition.address)
+            .await?
+            .ok_or(ContractManagementError::NotFound(definition.address))?;
+
+        counter!("torii_indexer_contract_registrations_total", "outcome" => "registered")
+            .increment(1);
+        info!(
+            target: LOG_TARGET,
+            contract_address = %format!("{:#x}", definition.address),
+            contract_type = %definition.r#type,
+            starting_block,
+            "Registered contract without restarting the indexer."
+        );
+
+        Ok(ContractRegistrationResult {
+            contract,
+            outcome: ContractRegistrationOutcome::Registered,
+            target_head,
+        })
+    }
+
+    async fn get_contract(
+        &self,
+        address: Felt,
+    ) -> Result<Option<Contract>, ContractManagementError> {
+        let query = ContractQuery {
+            contract_addresses: vec![address],
+            contract_types: vec![],
+        };
+        let contracts = self
+            .storage
+            .contracts(&query)
+            .await
+            .map_err(|error| ContractManagementError::Storage(error.to_string()))?;
+        Ok(contracts.into_iter().next())
     }
 
     pub async fn process(

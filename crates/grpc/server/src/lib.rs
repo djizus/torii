@@ -325,11 +325,10 @@ impl<P: Provider + Sync + Send + 'static> proto::world::world_server::World for 
             .try_into()
             .map_err(|e: ProtoError| Status::invalid_argument(e.to_string()))?;
 
-        let entities = self
-            .storage
-            .entities(&query)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+        let entities = self.storage.entities(&query).await.map_err(|e| {
+            tracing::error!(target: "torii::grpc::server", ?query, error = %e, "RetrieveEntities failed.");
+            Status::internal(e.to_string())
+        })?;
 
         Ok(Response::new(RetrieveEntitiesResponse {
             entities: entities.items.into_iter().map(Into::into).collect(),

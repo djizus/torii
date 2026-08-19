@@ -20,6 +20,7 @@ use rustls::{Certificate, PrivateKey, ServerConfig};
 use serde_json::json;
 use sqlx::SqlitePool;
 use starknet::providers::Provider;
+use starknet_crypto::Felt;
 use tokio::sync::RwLock;
 use tokio_rustls::TlsAcceptor;
 use torii_storage::Storage;
@@ -29,6 +30,9 @@ use tracing::{debug, warn};
 
 use crate::handlers::graphql::GraphQLHandler;
 use crate::handlers::grpc::GrpcHandler;
+use crate::handlers::indexing::{
+    ContractManagementConfig, ContractManagementHandler, ReadinessHandler,
+};
 use crate::handlers::mcp::McpHandler;
 use crate::handlers::metadata::MetadataHandler;
 use crate::handlers::r#static::StaticHandler;
@@ -48,8 +52,9 @@ pub struct ProxySettings {
     pub http2_keepalive_timeout: u64,
 }
 
-const DEFAULT_ALLOW_HEADERS: [&str; 13] = [
+const DEFAULT_ALLOW_HEADERS: [&str; 14] = [
     "accept",
+    "authorization",
     "origin",
     "content-type",
     "access-control-allow-origin",
@@ -131,7 +136,7 @@ pub fn is_websocket_upgrade(req: &Request<Body>) -> bool {
             .unwrap_or(false)
 }
 
-pub struct Proxy<P: Provider + Sync + Send + Debug + 'static> {
+pub struct Proxy<P: Provider + Sync + Send + Clone + Debug + 'static> {
     addr: SocketAddr,
     allowed_origins: Option<Vec<String>>,
     handlers: Arc<RwLock<Vec<Box<dyn Handler>>>>,
@@ -143,7 +148,7 @@ pub struct Proxy<P: Provider + Sync + Send + Debug + 'static> {
     _provider: std::marker::PhantomData<P>,
 }
 
-impl<P: Provider + Sync + Send + Debug + 'static> std::fmt::Debug for Proxy<P> {
+impl<P: Provider + Sync + Send + Clone + Debug + 'static> std::fmt::Debug for Proxy<P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Proxy")
             .field("addr", &self.addr)
@@ -159,7 +164,7 @@ pub struct TlsConfig {
     pub key_path: String,
 }
 
-impl<P: Provider + Sync + Send + Debug + 'static> Proxy<P> {
+impl<P: Provider + Sync + Send + Clone + Debug + 'static> Proxy<P> {
     #[allow(clippy::too_many_arguments)]
     pub fn new<S: Storage + 'static>(
         addr: SocketAddr,
@@ -169,6 +174,8 @@ impl<P: Provider + Sync + Send + Debug + 'static> Proxy<P> {
         artifacts_dir: Utf8PathBuf,
         pool: Arc<SqlitePool>,
         raw_sql: bool,
+        startup_contracts: Vec<Felt>,
+        contract_management: Option<ContractManagementConfig>,
         storage: Arc<S>,
         provider: P,
         version_spec: String,
@@ -185,6 +192,16 @@ impl<P: Provider + Sync + Send + Debug + 'static> Proxy<P> {
                 websocket_proxy_client.clone(),
             )),
             Box::new(GrpcHandler::new(grpc_addr, grpc_proxy_client.clone())),
+            Box::new(ReadinessHandler::new(
+                provider.clone(),
+                storage.clone(),
+                startup_contracts,
+            )),
+            Box::new(ContractManagementHandler::new(
+                contract_management,
+                provider.clone(),
+                storage.clone(),
+            )),
             Box::new(McpHandler::new(pool.clone())),
             Box::new(MetadataHandler::new(storage.clone(), provider)),
             Box::new(SqlHandler::new(pool.clone(), raw_sql)),

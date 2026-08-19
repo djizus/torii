@@ -1,5 +1,6 @@
 pub mod graphql;
 pub mod grpc;
+pub mod indexing;
 pub mod mcp;
 pub mod metadata;
 pub mod sql;

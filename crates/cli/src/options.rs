@@ -212,6 +212,28 @@ pub struct IndexingOptions {
     )]
     pub namespaces: Vec<String>,
 
+    /// Model tables that list deployed world contracts to auto-register
+    #[arg(
+        long = "indexing.world_registry_models",
+        value_delimiter = ',',
+        help = "Model tables (e.g. wf-WorldDeployed) whose `address` column lists deployed \
+                world contracts. Torii polls them and registers every address as a WORLD \
+                contract, so worlds deployed by an indexed factory are picked up without \
+                operator intervention — including after a reindex from zero."
+    )]
+    #[serde(default)]
+    pub world_registry_models: Vec<String>,
+
+    /// World addresses the registry auto-discovery must never register
+    #[arg(
+        long = "indexing.world_registry_exclusions",
+        value_delimiter = ',',
+        help = "World addresses that world_registry_models auto-discovery skips — e.g. finished \
+                or abandoned games whose data should stop being indexed and served."
+    )]
+    #[serde(default)]
+    pub world_registry_exclusions: Vec<String>,
+
     /// Models to index
     #[arg(
         long = "indexing.models",
@@ -288,6 +310,8 @@ impl Default for IndexingOptions {
             transaction_receipts: false,
             contracts: vec![],
             namespaces: vec![],
+            world_registry_models: vec![],
+            world_registry_exclusions: vec![],
             models: vec![],
             world_block: 0,
             controllers: false,

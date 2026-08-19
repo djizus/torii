@@ -29,6 +29,9 @@ use torii_storage::proto::{ContractDefinition, ContractType};
 use torii_storage::utils::format_world_scoped_id;
 use torii_storage::Storage;
 
+use crate::control::{
+    engine_control_channel, ContractManagementError, ContractRegistrationOutcome,
+};
 use crate::engine::{Engine, EngineConfig};
 use torii_indexer_fetcher::{Fetcher, FetcherConfig};
 use torii_processors::processors::Processors;
@@ -80,6 +83,80 @@ where
     db.execute().await.unwrap();
 
     Ok(engine)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[katana_runner::test(accounts = 10, db_dir = copy_spawn_and_move_db().as_str())]
+async fn test_register_contract_without_restarting_engine(sequencer: &RunnerCtx) {
+    let manifest: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../examples/spawn-and-move/manifest_dev.json"
+    ))
+    .unwrap();
+    let world_address = Felt::from_str(manifest["world"]["address"].as_str().unwrap()).unwrap();
+    let provider = Arc::new(JsonRpcClient::new(HttpTransport::new(sequencer.url())));
+
+    let tempfile = NamedTempFile::new().unwrap();
+    let options = SqliteConnectOptions::from_str(&tempfile.path().to_string_lossy())
+        .unwrap()
+        .create_if_missing(true);
+    let pool = SqlitePoolOptions::new()
+        .connect_with(options)
+        .await
+        .unwrap();
+    sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
+
+    let (shutdown_tx, _) = broadcast::channel(1);
+    let (mut executor, sender) = Executor::new(pool.clone(), shutdown_tx.clone(), provider.clone())
+        .await
+        .unwrap();
+    tokio::spawn(async move { executor.run().await.unwrap() });
+
+    let db = Sql::new(pool, sender, &[]).await.unwrap();
+    let cache = Arc::new(InMemoryCache::new(Arc::new(db.clone())).await.unwrap());
+    let db = db.with_cache(cache.clone());
+    let (control, control_receiver) = engine_control_channel();
+    let mut engine = Engine::new(
+        Arc::new(db),
+        cache,
+        provider,
+        Arc::new(Processors::default()),
+        EngineConfig::default(),
+        shutdown_tx.clone(),
+    )
+    .with_control_receiver(control_receiver);
+    let engine_handle = tokio::spawn(async move { engine.start().await });
+
+    let definition = ContractDefinition {
+        address: world_address,
+        r#type: ContractType::WORLD,
+        starting_block: Some(1),
+    };
+    let registered = control.register_contract(definition.clone()).await.unwrap();
+    assert_eq!(registered.outcome, ContractRegistrationOutcome::Registered);
+    assert_eq!(registered.contract.contract_address, world_address);
+    assert_eq!(registered.contract.contract_type, ContractType::WORLD);
+
+    let registered_again = control.register_contract(definition).await.unwrap();
+    assert_eq!(
+        registered_again.outcome,
+        ContractRegistrationOutcome::AlreadyRegistered
+    );
+
+    let conflict = control
+        .register_contract(ContractDefinition {
+            address: world_address,
+            r#type: ContractType::ERC20,
+            starting_block: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        conflict,
+        ContractManagementError::TypeConflict { .. }
+    ));
+
+    shutdown_tx.send(()).unwrap();
+    engine_handle.await.unwrap().unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]

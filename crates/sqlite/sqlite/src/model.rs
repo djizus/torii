@@ -914,7 +914,19 @@ impl Sql {
         let mut has_more_pages = false;
         let executor = PaginationExecutor::new(self.pool.clone());
 
-        for chunk in schemas.values().collect::<Vec<_>>().chunks(SQL_MAX_JOINS) {
+        // Several worlds may register the same (namespace, name) model; they
+        // all share one model table, so emit each table's JOIN exactly once.
+        // Joining the same table twice without an alias makes SQLite reject
+        // the whole query with "ambiguous column name" (issue #433 class,
+        // gRPC arm — the schemas map itself stays world-scoped for row
+        // mapping).
+        let mut seen_tables = HashSet::new();
+        let unique_schemas = schemas
+            .values()
+            .filter(|schema| seen_tables.insert(schema.name()))
+            .collect::<Vec<_>>();
+
+        for chunk in unique_schemas.chunks(SQL_MAX_JOINS) {
             // Strategy: Start from model_relation_table and use index hints for optimal performance
             // The composite index (model_id, entity_id) dramatically reduces the scan size
             // when filtering by model_id on a large entity set

@@ -9476,6 +9476,7 @@ dependencies = [
  "tokio-stream",
  "tokio-tungstenite 0.20.1",
  "tokio-util",
+ "torii-indexer",
  "torii-mcp",
  "torii-processors",
  "torii-sqlite",

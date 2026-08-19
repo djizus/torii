@@ -32,6 +32,40 @@ grpcurl -plaintext 127.0.0.1:50051 list
 grpcurl -plaintext 127.0.0.1:50051 describe world.World
 ```
 
+Check startup-contract readiness:
+
+```bash
+curl -s http://127.0.0.1:8080/ready
+```
+
+The startup contract set is fixed for the process lifetime. Runtime additions do not make an already-serving process
+unready, while a replacement process waits for every contract loaded from its startup config to catch up.
+
+## Dynamic contract management
+
+Enable the append-only management API with a `TORII_ADMIN_TOKEN` environment variable of at least 32 characters.
+
+Register a world without restarting Torii:
+
+```bash
+curl -s http://127.0.0.1:8080/admin/indexing/contracts \
+  -X POST \
+  -H "authorization: Bearer $TORII_ADMIN_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"address":"0x1234","contract_type":"WORLD","starting_block":42}'
+```
+
+Check its cursor against the current chain head:
+
+```bash
+curl -s http://127.0.0.1:8080/admin/indexing/contracts/0x1234 \
+  -H "authorization: Bearer $TORII_ADMIN_TOKEN"
+```
+
+Registration is idempotent for the same address and contract type. Reusing an address with a different type returns a
+conflict. Additions are persisted in Torii's database, but the external deployment configuration should remain the
+durable source of truth for tasks that start with a fresh database.
+
 ## SQL over HTTP
 
 HTTP SQL is available only if `--http.sql true` (default true).
@@ -167,4 +201,3 @@ curl -s http://127.0.0.1:9200/metrics | head
 For Grafana/Prometheus setup, use:
 - `docker-compose -f docker-compose.grafana.yml up -d`
 - `docs/grafana-setup.md`
-

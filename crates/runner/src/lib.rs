@@ -45,12 +45,14 @@ use torii_cache::InMemoryCache;
 use torii_cli::ToriiArgs;
 use torii_controllers::sync::ControllersSync;
 use torii_grpc_server::GrpcConfig;
+use torii_indexer::control::{engine_control_channel, EngineControlClient};
 use torii_indexer::engine::{Engine, EngineConfig};
 use torii_indexer::{FetcherConfig, FetchingFlags, IndexingFlags};
 use torii_libp2p_relay::Relay;
 use torii_messaging::{Messaging, MessagingConfig};
 use torii_processors::{EventProcessorConfig, Processors};
 use torii_server::proxy::{Proxy, ProxySettings};
+use torii_server::ContractManagementConfig;
 use torii_sqlite::executor::Executor;
 use torii_sqlite::{Sql, SqlConfig};
 use torii_storage::proto::{ContractDefinition, ContractType};
@@ -63,6 +65,8 @@ mod constants;
 
 use crate::constants::LOG_TARGET;
 const MIN_THREADS: usize = 1;
+const TORII_ADMIN_TOKEN_ENV: &str = "TORII_ADMIN_TOKEN";
+const MIN_ADMIN_TOKEN_LENGTH: usize = 32;
 
 #[derive(Debug, Clone)]
 pub enum AllocationStrategy {
@@ -645,6 +649,17 @@ impl Runner {
             "Runtime allocation calculated"
         );
 
+        let mut seen_startup_contracts = HashSet::new();
+        let startup_contracts = self
+            .args
+            .indexing
+            .contracts
+            .iter()
+            .map(|contract| contract.address)
+            .filter(|address| seen_startup_contracts.insert(*address))
+            .collect::<Vec<_>>();
+        let (engine_control, control_receiver) = engine_control_channel();
+        let contract_management = contract_management_config(engine_control.clone())?;
         let mut engine: Engine<Arc<JsonRpcClient<HttpTransport>>> = Engine::new_with_controllers(
             storage.clone(),
             cache.clone(),
@@ -697,7 +712,83 @@ impl Runner {
             },
             shutdown_tx.clone(),
             controllers,
-        );
+        )
+        .with_control_receiver(control_receiver);
+
+        // World registry auto-discovery: poll the configured model tables for
+        // deployed world addresses and register each one as a WORLD contract.
+        // Polling the DB (instead of hooking event decoding) keeps this on the
+        // same proven path as the admin API, and re-registers everything after
+        // a reindex from zero without any operator involvement.
+        if !self.args.indexing.world_registry_models.is_empty() {
+            let control = engine_control.clone();
+            let pool = readonly_pool.clone();
+            let tables = self.args.indexing.world_registry_models.clone();
+            let exclusions: HashSet<Felt> = self
+                .args
+                .indexing
+                .world_registry_exclusions
+                .iter()
+                .filter_map(|address| Felt::from_hex(address.trim()).ok())
+                .collect();
+            let mut registry_shutdown_rx = shutdown_tx.subscribe();
+            tokio::spawn(async move {
+                let mut known: HashSet<Felt> = exclusions;
+                loop {
+                    tokio::select! {
+                        _ = registry_shutdown_rx.recv() => break,
+                        _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                    }
+
+                    for table in &tables {
+                        let query = format!("SELECT DISTINCT address FROM [{table}]");
+                        // The table only exists once the registry world itself
+                        // has been indexed; treat errors as "nothing yet".
+                        let rows: Vec<(String,)> = match sqlx::query_as(&query).fetch_all(&pool).await
+                        {
+                            Ok(rows) => rows,
+                            Err(_) => continue,
+                        };
+
+                        for (address,) in rows {
+                            let Ok(address) = Felt::from_hex(address.trim()) else {
+                                continue;
+                            };
+                            if !known.insert(address) {
+                                continue;
+                            }
+
+                            let definition = ContractDefinition {
+                                address,
+                                r#type: ContractType::WORLD,
+                                starting_block: None,
+                            };
+                            match control.register_contract(definition).await {
+                                Ok(result) => {
+                                    info!(
+                                        target: LOG_TARGET,
+                                        address = format!("{address:#x}"),
+                                        table = %table,
+                                        outcome = ?result.outcome,
+                                        "Auto-registered world from registry model."
+                                    );
+                                }
+                                Err(error) => {
+                                    known.remove(&address);
+                                    warn!(
+                                        target: LOG_TARGET,
+                                        address = format!("{address:#x}"),
+                                        table = %table,
+                                        error = %error,
+                                        "Failed to auto-register world; will retry."
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
 
         let shutdown_rx = shutdown_tx.subscribe();
         let temp_dir = TempDir::new()?;
@@ -770,6 +861,8 @@ impl Runner {
             absolute_path.clone(),
             Arc::new(readonly_pool.clone()),
             self.args.server.raw_sql,
+            startup_contracts,
+            contract_management,
             storage.clone(),
             provider.clone(),
             self.version_spec.clone(),
@@ -936,6 +1029,31 @@ impl Runner {
     }
 }
 
+fn contract_management_config(
+    control: EngineControlClient,
+) -> anyhow::Result<Option<ContractManagementConfig>> {
+    let token = match std::env::var(TORII_ADMIN_TOKEN_ENV) {
+        Ok(token) if !token.trim().is_empty() => token,
+        _ => {
+            info!(
+                target: LOG_TARGET,
+                environment_variable = TORII_ADMIN_TOKEN_ENV,
+                "Dynamic contract management endpoint is disabled."
+            );
+            return Ok(None);
+        }
+    };
+
+    if token.len() < MIN_ADMIN_TOKEN_LENGTH {
+        anyhow::bail!(
+            "{TORII_ADMIN_TOKEN_ENV} must contain at least {MIN_ADMIN_TOKEN_LENGTH} characters"
+        );
+    }
+
+    info!(target: LOG_TARGET, "Dynamic contract management endpoint is enabled.");
+    Ok(Some(ContractManagementConfig::new(token, control)))
+}
+
 async fn spawn_rebuilding_graphql_server<P: Provider + Sync + Send + Clone + Debug + 'static>(
     shutdown_tx: Sender<()>,
     pool: Arc<SqlitePool>,
@@ -944,6 +1062,7 @@ async fn spawn_rebuilding_graphql_server<P: Provider + Sync + Send + Clone + Deb
     storage: Arc<dyn ReadOnlyStorage>,
 ) {
     let mut broker = MemoryBroker::<ModelUpdate>::subscribe();
+    let mut active_server = None;
 
     loop {
         let shutdown_rx = shutdown_tx.subscribe();
@@ -951,9 +1070,9 @@ async fn spawn_rebuilding_graphql_server<P: Provider + Sync + Send + Clone + Deb
             torii_graphql::server::new(shutdown_rx, &pool, messaging.clone(), storage.clone())
                 .await;
 
-        tokio::spawn(new_server);
-
+        let replacement = tokio::spawn(new_server);
         proxy_server.set_graphql_addr(new_addr).await;
+        replace_graphql_server(&mut active_server, replacement).await;
 
         // Break the loop if there are no more events
         if broker.next().await.is_none() {
@@ -961,6 +1080,23 @@ async fn spawn_rebuilding_graphql_server<P: Provider + Sync + Send + Clone + Deb
         } else {
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
+    }
+
+    stop_graphql_server(active_server).await;
+}
+
+async fn replace_graphql_server(
+    active_server: &mut Option<tokio::task::JoinHandle<()>>,
+    replacement: tokio::task::JoinHandle<()>,
+) {
+    let previous = active_server.replace(replacement);
+    stop_graphql_server(previous).await;
+}
+
+async fn stop_graphql_server(server: Option<tokio::task::JoinHandle<()>>) {
+    if let Some(server) = server {
+        server.abort();
+        let _ = server.await;
     }
 }
 
@@ -1100,4 +1236,26 @@ async fn generate_mkcert_certificates() -> anyhow::Result<(String, String)> {
         cert_path.to_string_lossy().to_string(),
         key_path.to_string_lossy().to_string(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn replacing_graphql_server_stops_the_previous_server() {
+        let first = tokio::spawn(std::future::pending::<()>());
+        let first_status = first.abort_handle();
+        let second = tokio::spawn(std::future::pending::<()>());
+        let second_status = second.abort_handle();
+        let mut active_server = Some(first);
+
+        replace_graphql_server(&mut active_server, second).await;
+
+        assert!(first_status.is_finished());
+        assert!(!second_status.is_finished());
+
+        stop_graphql_server(active_server).await;
+        assert!(second_status.is_finished());
+    }
 }
